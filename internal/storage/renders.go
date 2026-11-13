@@ -31,9 +31,37 @@ func (repo *Repository) GetJob(id string) (domain.RenderJob, error) {
 	return job, nil
 }
 
+func (repo *Repository) ListJobs() ([]domain.RenderJob, error) {
+	repo.mu.RLock()
+	defer repo.mu.RUnlock()
+	entries, err := os.ReadDir(repo.path("jobs"))
+	if err != nil {
+		return nil, domain.Wrap(domain.KindInternal, "storage_error", "", "cannot list render jobs", err)
+	}
+	jobs := make([]domain.RenderJob, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		var job domain.RenderJob
+		if err := readJSON(repo.path("jobs", entry.Name()), &job); err != nil {
+			return nil, domain.Wrap(domain.KindInternal, "storage_error", "", "cannot read render job "+entry.Name(), err)
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, nil
+}
+
+// CommitRenderArtifacts publishes the output and receipt as one indivisible
+// unit: both files are staged in a temporary directory and the folder is
+// moved into place with a single rename, so a render folder either appears
+// complete or not at all.
 func (repo *Repository) CommitRenderArtifacts(id string, wav []byte, receipt domain.RenderReceipt) error {
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
+	if receipt.RenderID != id {
+		return domain.E(domain.KindConflict, "render_conflict", "render_id", "receipt does not belong to render")
+	}
 	final := repo.path("renders", id)
 	if _, err := os.Stat(final); err == nil {
 		return domain.E(domain.KindConflict, "render_conflict", "render_id", "render artifacts already exist")
@@ -50,11 +78,11 @@ func (repo *Repository) CommitRenderArtifacts(id string, wav []byte, receipt dom
 	if err := writeBytes(filepath.Join(temp, "output.wav"), wav, 0o640); err != nil {
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot write render output", err)
 	}
-	if len(wav) > 2<<20 {
-		return repo.publishRenderCheckpoint(id, temp, final, receipt)
-	}
 	if err := writeJSONAtomic(filepath.Join(temp, "receipt.json"), receipt, 0o640); err != nil {
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot write render receipt", err)
+	}
+	if err := syncDirectory(temp); err != nil {
+		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot sync render staging directory", err)
 	}
 	if err := os.Rename(temp, final); err != nil {
 		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot commit render artifacts", err)
@@ -65,21 +93,42 @@ func (repo *Repository) CommitRenderArtifacts(id string, wav []byte, receipt dom
 	return nil
 }
 
-func (repo *Repository) publishRenderCheckpoint(id, temp, final string, receipt domain.RenderReceipt) error {
-	if receipt.RenderID != id {
-		return domain.E(domain.KindConflict, "render_conflict", "render_id", "receipt does not belong to render")
+func (repo *Repository) GetRenderReceipt(id string) (domain.RenderReceipt, error) {
+	repo.mu.RLock()
+	defer repo.mu.RUnlock()
+	var receipt domain.RenderReceipt
+	if err := readJSON(repo.path("renders", id, "receipt.json"), &receipt); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return domain.RenderReceipt{}, domain.E(domain.KindUnready, "render_not_completed", "render_id", "render receipt is not available")
+		}
+		return domain.RenderReceipt{}, domain.Wrap(domain.KindInternal, "storage_error", "", "cannot read render receipt", err)
 	}
-	if err := os.Rename(temp, final); err != nil {
-		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot publish render checkpoint", err)
+	return receipt, nil
+}
+
+func (repo *Repository) RenderOutputSize(id string) (int64, error) {
+	repo.mu.RLock()
+	defer repo.mu.RUnlock()
+	info, err := os.Stat(repo.path("renders", id, "output.wav"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, domain.E(domain.KindUnready, "render_not_completed", "render_id", "render output is not available")
+		}
+		return 0, domain.Wrap(domain.KindInternal, "storage_error", "", "cannot inspect render output", err)
+	}
+	return info.Size(), nil
+}
+
+// RemoveRenderArtifacts deletes a render folder that was never committed
+// completely, so partial output cannot be mistaken for a finished render.
+func (repo *Repository) RemoveRenderArtifacts(id string) error {
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	if err := os.RemoveAll(repo.path("renders", id)); err != nil {
+		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot remove incomplete render artifacts", err)
 	}
 	if err := syncDirectory(repo.path("renders")); err != nil {
-		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot sync render checkpoint", err)
-	}
-	if err := writeJSONAtomic(filepath.Join(final, "receipt.json"), receipt, 0o640); err != nil {
-		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot finish render checkpoint", err)
-	}
-	if err := syncDirectory(final); err != nil {
-		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot sync render receipt", err)
+		return domain.Wrap(domain.KindInternal, "storage_error", "", "cannot sync render index", err)
 	}
 	return nil
 }

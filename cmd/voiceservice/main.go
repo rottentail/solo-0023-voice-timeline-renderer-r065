@@ -2,18 +2,15 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
-	"voice-timeline-renderer/internal/domain"
 	"voice-timeline-renderer/internal/httpapi"
 	"voice-timeline-renderer/internal/service"
 	"voice-timeline-renderer/internal/storage"
@@ -33,11 +30,11 @@ func main() {
 		slog.Error("cannot initialize repository", "error", err)
 		os.Exit(1)
 	}
-	if err := reconcilePublishedRenders(*dataDir); err != nil {
-		slog.Error("cannot reconcile render checkpoints", "error", err)
+	serviceLayer := service.New(repo, service.DefaultConfig())
+	if err := serviceLayer.ReconcileRenders(context.Background()); err != nil {
+		slog.Error("cannot reconcile render jobs", "error", err)
 		os.Exit(1)
 	}
-	serviceLayer := service.New(repo, service.DefaultConfig())
 	api := httpapi.New(serviceLayer, httpapi.Options{
 		MaxSourceRequestBytes: 48 << 20,
 		MaxJSONBytes:          2 << 20,
@@ -65,43 +62,4 @@ func main() {
 		slog.Error("HTTP service stopped", "error", err)
 		os.Exit(1)
 	}
-}
-
-func reconcilePublishedRenders(root string) error {
-	entries, err := os.ReadDir(filepath.Join(root, "jobs"))
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		path := filepath.Join(root, "jobs", entry.Name())
-		payload, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		var job domain.RenderJob
-		if err := json.Unmarshal(payload, &job); err != nil {
-			return err
-		}
-		if job.State == domain.RenderCompleted || job.State == domain.RenderQueued {
-			continue
-		}
-		info, err := os.Stat(filepath.Join(root, "renders", job.ID, "output.wav"))
-		if err != nil || info.Size() < 44 {
-			continue
-		}
-		job.State = domain.RenderCompleted
-		job.Error = nil
-		job.UpdatedAt = time.Now().UTC()
-		payload, err = json.MarshalIndent(job, "", "  ")
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(path, append(payload, '\n'), 0o640); err != nil {
-			return err
-		}
-	}
-	return nil
 }

@@ -15,7 +15,11 @@ type Repository interface {
 	GetTimeline(string) (domain.Timeline, error)
 	SaveJob(domain.RenderJob) error
 	GetJob(string) (domain.RenderJob, error)
+	ListJobs() ([]domain.RenderJob, error)
 	CommitRenderArtifacts(string, []byte, domain.RenderReceipt) error
+	GetRenderReceipt(string) (domain.RenderReceipt, error)
+	RenderOutputSize(string) (int64, error)
+	RemoveRenderArtifacts(string) error
 	GetRenderOutput(string) ([]byte, domain.RenderReceipt, error)
 }
 
@@ -104,8 +108,7 @@ func (s *Service) GetReceipt(ctx context.Context, id string) (domain.RenderRecei
 	if job.State != domain.RenderCompleted {
 		return domain.RenderReceipt{}, domain.E(domain.KindUnready, "render_not_completed", "render_id", "render receipt is available only after completion")
 	}
-	_, receipt, err := s.repo.GetRenderOutput(id)
-	return receipt, err
+	return s.repo.GetRenderReceipt(id)
 }
 
 func (s *Service) GetOutput(ctx context.Context, id string) ([]byte, domain.RenderReceipt, error) {

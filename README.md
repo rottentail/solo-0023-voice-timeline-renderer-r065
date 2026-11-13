@@ -134,6 +134,16 @@ The render runs through the durable states
 terminal `failed` state with a stable error code and does not expose a partial
 output folder.
 
+Render jobs are durable and connection-independent. Once accepted, a render
+runs to a terminal state even if the client disconnects, and a completed
+render keeps serving the same output and receipt to any later connection,
+including after a service restart. On startup the service reconciles jobs
+left in an active state by a previous run: a job whose output and receipt
+were fully committed is marked `completed` from the durable receipt, and any
+other interrupted job is marked `failed` with the stable `render_interrupted`
+code while its partial artifacts are removed. Terminal jobs are never
+rewritten.
+
 ### Read resources
 
 - `GET /v1/sources/{source_id}`

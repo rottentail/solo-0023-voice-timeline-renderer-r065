@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"voice-timeline-renderer/internal/domain"
@@ -31,7 +30,11 @@ func (s *Service) CreateRender(
 		if existing.TimelineID != request.TimelineID {
 			return domain.RenderJob{}, false, domain.E(domain.KindConflict, "render_conflict", "render_id", "identifier is already bound to a different timeline")
 		}
-		return existing, false, nil
+		settled, err := s.settleInterruptedJob(existing)
+		if err != nil {
+			return domain.RenderJob{}, false, err
+		}
+		return settled, false, nil
 	}
 	if appErr := domain.AsAppError(getErr); appErr.Kind != domain.KindNotFound {
 		return domain.RenderJob{}, false, getErr
@@ -67,8 +70,11 @@ func (s *Service) CreateRender(
 		}
 		sources[span.SourceID] = render.SourceInput{Asset: asset, WAV: payload}
 	}
+	// The render outlives the request that started it: a client disconnect
+	// must neither strand the durable job in an active state nor discard
+	// work that finishes after the caller went away.
 	result, renderErr := render.Render(
-		ctx,
+		context.WithoutCancel(ctx),
 		id,
 		plan,
 		sources,
@@ -76,9 +82,6 @@ func (s *Service) CreateRender(
 		time.Now().UTC(),
 	)
 	if renderErr != nil {
-		if errors.Is(renderErr, context.Canceled) || errors.Is(renderErr, context.DeadlineExceeded) {
-			return s.checkpointInterruptedRender(job, renderErr)
-		}
 		return s.failRender(job, domain.Wrap(domain.KindInternal, "render_failed", "", "timeline rendering failed", renderErr))
 	}
 	if err := s.advanceJob(&job, domain.RenderFinalizing, nil); err != nil {
@@ -87,9 +90,8 @@ func (s *Service) CreateRender(
 	if err := s.repo.CommitRenderArtifacts(id, result.WAV, result.Receipt); err != nil {
 		return s.failRender(job, err)
 	}
-	if err := ctx.Err(); err != nil {
-		return s.failRender(job, domain.Wrap(domain.KindInternal, "render_cancelled", "render_id", "render response was cancelled", err))
-	}
+	// The artifacts are committed atomically; from here the only honest
+	// outcome is completed, whatever happens to the client connection.
 	job.Output = &result.Output
 	job.ReceiptDigest = result.Output.Digest
 	if err := s.advanceJob(&job, domain.RenderCompleted, nil); err != nil {
@@ -98,27 +100,99 @@ func (s *Service) CreateRender(
 	return job, true, nil
 }
 
-func (s *Service) checkpointInterruptedRender(job domain.RenderJob, cause error) (domain.RenderJob, bool, error) {
-	current, err := s.repo.GetJob(job.ID)
+// ReconcileRenders settles render jobs that a previous service lifetime
+// left in an active state, for example by stopping mid-render. A job
+// whose output and receipt were fully committed is completed from the
+// durable receipt; any other active job is failed with a stable
+// interruption code and its partial artifacts are removed. Terminal jobs
+// are never rewritten, so completed renders keep delivering their
+// original output and receipt across restarts.
+func (s *Service) ReconcileRenders(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	jobs, err := s.repo.ListJobs()
 	if err != nil {
-		return job, true, err
+		return err
 	}
-	if current.TimelineID != job.TimelineID {
-		return job, true, domain.E(domain.KindConflict, "render_conflict", "render_id", "interrupted render belongs to another timeline")
+	for _, job := range jobs {
+		if _, err := s.settleInterruptedJob(job); err != nil {
+			return err
+		}
 	}
-	if current.State == domain.RenderCompleted {
-		return current, false, nil
+	return nil
+}
+
+// settleInterruptedJob moves a job stuck in an active state to the
+// terminal state that matches the committed artifacts. Terminal jobs are
+// returned unchanged.
+func (s *Service) settleInterruptedJob(job domain.RenderJob) (domain.RenderJob, error) {
+	switch job.State {
+	case domain.RenderCompleted, domain.RenderFailed:
+		return job, nil
 	}
-	current.Error = &domain.ErrorDetail{
+	if receipt, ok := s.committedReceipt(job); ok {
+		job.Output = &receipt.Output
+		job.ReceiptDigest = receipt.Output.Digest
+		if err := s.completeCommittedJob(&job); err != nil {
+			return domain.RenderJob{}, err
+		}
+		return job, nil
+	}
+	detail := &domain.ErrorDetail{
 		Code:    "render_interrupted",
-		Message: "render request interrupted before response delivery",
+		Message: "render was interrupted before completion; submit a new render_id to retry",
 		Field:   "render_id",
 	}
-	current.UpdatedAt = time.Now().UTC()
-	if err := s.repo.SaveJob(current); err != nil {
-		return current, true, err
+	if err := s.advanceJob(&job, domain.RenderFailed, detail); err != nil {
+		return domain.RenderJob{}, err
 	}
-	return current, true, domain.Wrap(domain.KindInternal, "render_interrupted", "render_id", "render progress was checkpointed", cause)
+	if err := s.repo.RemoveRenderArtifacts(job.ID); err != nil {
+		return domain.RenderJob{}, err
+	}
+	return job, nil
+}
+
+// committedReceipt reports the committed receipt for a job when the
+// render folder holds a complete output and receipt pair that belongs to
+// this job.
+func (s *Service) committedReceipt(job domain.RenderJob) (domain.RenderReceipt, bool) {
+	receipt, err := s.repo.GetRenderReceipt(job.ID)
+	if err != nil {
+		return domain.RenderReceipt{}, false
+	}
+	if receipt.RenderID != job.ID || receipt.TimelineID != job.TimelineID {
+		return domain.RenderReceipt{}, false
+	}
+	size, err := s.repo.RenderOutputSize(job.ID)
+	if err != nil || size != receipt.Output.ByteCount {
+		return domain.RenderReceipt{}, false
+	}
+	return receipt, true
+}
+
+// completeCommittedJob walks a job with committed artifacts through the
+// remaining valid transitions into completed.
+func (s *Service) completeCommittedJob(job *domain.RenderJob) error {
+	switch job.State {
+	case domain.RenderQueued:
+		if err := s.advanceJob(job, domain.RenderRendering, nil); err != nil {
+			return err
+		}
+		fallthrough
+	case domain.RenderRendering:
+		if err := s.advanceJob(job, domain.RenderFinalizing, nil); err != nil {
+			return err
+		}
+		fallthrough
+	case domain.RenderFinalizing:
+		if err := s.advanceJob(job, domain.RenderCompleted, nil); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) advanceJob(job *domain.RenderJob, state domain.RenderState, detail *domain.ErrorDetail) error {
